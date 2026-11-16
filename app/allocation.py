@@ -116,6 +116,220 @@ class Allocation:
     households: int
 
 
+# ---------- 两期生成结果归因 ----------
+#
+# 设 A（前）与 B（后）为两次成功生成：
+#   A = 分摊(old_A, new_A)                基准分摊
+#   B = 分摊(old_B, new_B)                对比分摊
+#   C2 = 分摊(old_B, new_A)               “先换旧网格”的中间折算
+#   C3 = 分摊(old_A, new_B)               “先换新片区”的中间折算
+#
+# 两条折算路径对片区 d 的贡献（均为整数户）：
+#   先换旧网格：旧网格 = C2-A，新片区 = B-C2
+#   先换新片区：新片区 = C3-A，旧网格 = B-C3
+# 两者取算术平均，得到允许半户的贡献；两项之和恒等于 B-A。
+#
+# 注意：C2/C3 是从两期真实输入交叉组合出来的“反事实”分摊，
+# 必须同样满足旧格被片区完整覆盖，否则拒绝归因而不是猜测。
+
+class AttributionDistrictMismatchError(ValueError):
+    """两次生成的片区编号集合不一致，无法逐片区归因。"""
+
+
+class AttributionCoverageError(ValueError):
+    """基准或交叉折算缺少完整覆盖，拒绝归因。"""
+
+
+class AttributionIntegrityError(ValueError):
+    """内部对账校验失败（理论上不应发生）。"""
+
+
+@dataclass(frozen=True)
+class PathContribution:
+    """某条 change 顺序路径下，片区变动中两项来源的整数户贡献。"""
+
+    old_grid: int
+    new_boundary: int
+
+
+@dataclass(frozen=True)
+class DistrictAttribution:
+    district_id: str
+    before_households: int
+    after_households: int
+    old_grid_half_units: int
+    new_boundary_half_units: int
+    old_grid_first: PathContribution
+    new_boundary_first: PathContribution
+    old_b_with_new_a: int
+    old_a_with_new_b: int
+
+    @property
+    def change(self) -> int:
+        return self.after_households - self.before_households
+
+
+@dataclass(frozen=True)
+class AttributionResult:
+    district_ids: tuple[str, ...]
+    districts: tuple[DistrictAttribution, ...]
+    total_before: int
+    total_after: int
+    total_old_grid_half_units: int
+    total_new_boundary_half_units: int
+
+    @property
+    def total_change(self) -> int:
+        return self.total_after - self.total_before
+
+
+def _district_totals(
+    allocations: list[Allocation], district_ids: set[str]
+) -> dict[str, int]:
+    totals = {d_id: 0 for d_id in district_ids}
+    for a in allocations:
+        if a.district_id not in totals:  # 防御性检查：不会发生
+            raise AttributionIntegrityError(
+                f"分摊结果出现未知片区 {a.district_id}"
+            )
+        totals[a.district_id] += a.households
+    return totals
+
+
+def _allocate_or_raise(
+    old_cells: list[OldCell], districts: list[NewDistrict], label: str
+) -> list[Allocation]:
+    try:
+        return allocate(old_cells, districts)
+    except ValueError as exc:
+        raise AttributionCoverageError(f"{label}：{exc}") from exc
+
+
+def attribute_periods(
+    old_cells_a: list[OldCell],
+    districts_a: list[NewDistrict],
+    old_cells_b: list[OldCell],
+    districts_b: list[NewDistrict],
+) -> AttributionResult:
+    """按两条折算路径的平均值，把两期片区户数差额拆成两项来源。
+
+    - 只接受片区编号集合完全相同的两期；
+    - 以传入的（任务各自固定的）旧网格 / 新片区版本为准，不读取“当前版本”；
+    - 交叉折算 C2、C3 任一缺少完整覆盖即抛 AttributionCoverageError；
+    - 每个片区 old_grid + new_boundary = 实测差额（半户为单位精确对账）；
+    - 全部片区贡献之和 = 两期总户数变化。
+    """
+    ids_a = {d.id for d in districts_a}
+    ids_b = {d.id for d in districts_b}
+    if ids_a != ids_b:
+        only_a = sorted(ids_a - ids_b, key=_id_sort_key)
+        only_b = sorted(ids_b - ids_a, key=_id_sort_key)
+        parts = []
+        if only_a:
+            parts.append(f"仅前一期有 {only_a}")
+        if only_b:
+            parts.append(f"仅后一期有 {only_b}")
+        raise AttributionDistrictMismatchError(
+            "两次生成的片区编号集合不同，无法逐片区归因：" + "；".join(parts)
+        )
+
+    district_ids = ids_a
+
+    # 基准期 / 对比期（任务本身已成功，正常不会触发覆盖错误）
+    totals_a = _district_totals(
+        _allocate_or_raise(old_cells_a, districts_a, "前一期基准分摊失败"),
+        district_ids,
+    )
+    totals_b = _district_totals(
+        _allocate_or_raise(old_cells_b, districts_b, "后一期基准分摊失败"),
+        district_ids,
+    )
+
+    # 交叉折算 1：先换旧网格（旧网格 B + 新片区 A）
+    totals_old_first_mid = _district_totals(
+        _allocate_or_raise(
+            old_cells_b,
+            districts_a,
+            "交叉折算「先换旧网格」缺少完整覆盖（旧网格 B 配新片区 A）",
+        ),
+        district_ids,
+    )
+    # 交叉折算 2：先换新片区（旧网格 A + 新片区 B）
+    totals_new_first_mid = _district_totals(
+        _allocate_or_raise(
+            old_cells_a,
+            districts_b,
+            "交叉折算「先换新片区」缺少完整覆盖（旧网格 A 配新片区 B）",
+        ),
+        district_ids,
+    )
+
+    rows: list[DistrictAttribution] = []
+    for d_id in sorted(district_ids, key=_id_sort_key):
+        before = totals_a[d_id]
+        after = totals_b[d_id]
+        c2 = totals_old_first_mid[d_id]
+        c3 = totals_new_first_mid[d_id]
+
+        old_grid_first = PathContribution(
+            old_grid=c2 - before,
+            new_boundary=after - c2,
+        )
+        new_boundary_first = PathContribution(
+            old_grid=after - c3,
+            new_boundary=c3 - before,
+        )
+        # 两条路径贡献的平均值；以“半户”为单位保存，避免浮点误差
+        old_grid_half_units = (
+            old_grid_first.old_grid + new_boundary_first.old_grid
+        )
+        new_boundary_half_units = (
+            old_grid_first.new_boundary + new_boundary_first.new_boundary
+        )
+        change = after - before
+        if old_grid_half_units + new_boundary_half_units != 2 * change:
+            raise AttributionIntegrityError(
+                f"片区 {d_id} 两项贡献之和 {old_grid_half_units / 2}"
+                f" + {new_boundary_half_units / 2} 不等于实测差额 {change}"
+            )
+
+        rows.append(
+            DistrictAttribution(
+                district_id=d_id,
+                before_households=before,
+                after_households=after,
+                old_grid_half_units=old_grid_half_units,
+                new_boundary_half_units=new_boundary_half_units,
+                old_grid_first=old_grid_first,
+                new_boundary_first=new_boundary_first,
+                old_b_with_new_a=c2,
+                old_a_with_new_b=c3,
+            )
+        )
+
+    total_before = sum(totals_a.values())
+    total_after = sum(totals_b.values())
+    total_old_half = sum(r.old_grid_half_units for r in rows)
+    total_new_half = sum(r.new_boundary_half_units for r in rows)
+    if total_old_half + total_new_half != 2 * (total_after - total_before):
+        raise AttributionIntegrityError(
+            "两项贡献汇总不等于两期总户数变化："
+            f"{total_old_half / 2} + {total_new_half / 2}"
+            f" != {total_after - total_before}"
+        )
+    if sum(r.change for r in rows) != total_after - total_before:
+        raise AttributionIntegrityError("各片区实测差额汇总与总户数变化不一致")
+
+    return AttributionResult(
+        district_ids=tuple(sorted(district_ids, key=_id_sort_key)),
+        districts=tuple(rows),
+        total_before=total_before,
+        total_after=total_after,
+        total_old_grid_half_units=total_old_half,
+        total_new_boundary_half_units=total_new_half,
+    )
+
+
 def allocate(
     old_cells: list[OldCell], districts: list[NewDistrict]
 ) -> list[Allocation]:

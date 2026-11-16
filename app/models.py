@@ -154,3 +154,61 @@ class CurrentResultOut(BaseModel):
 class HealthOut(BaseModel):
     status: str
     db: str
+
+
+class PathContributionOut(BaseModel):
+    """某条折算路径下两项来源的整数户贡献。"""
+
+    old_grid_change: int = Field(..., description="旧网格数据修订带来的户数变化")
+    new_boundary_change: int = Field(..., description="新片区边界调整带来的户数变化")
+
+
+class DistrictAttributionOut(BaseModel):
+    """单个片区的归因：两项来源取两条折算路径的平均值（允许半户）。"""
+
+    district_id: str
+    before_households: int = Field(..., description="前一期该片区户数")
+    after_households: int = Field(..., description="后一期该片区户数")
+    change: int = Field(..., description="实测差额 = after - before（整数）")
+    old_grid_change: float = Field(
+        ..., description="旧网格数据修订贡献（半户粒度，如 1.5）"
+    )
+    new_boundary_change: float = Field(
+        ..., description="新片区边界调整贡献（半户粒度，如 2.5）"
+    )
+    old_grid_first: PathContributionOut = Field(
+        ..., description="先换旧网格、后换片区的折算路径贡献"
+    )
+    new_boundary_first: PathContributionOut = Field(
+        ..., description="先换片区、后换旧网格的折算路径贡献"
+    )
+    old_grid_b_with_new_districts_a: int = Field(
+        ..., description="折算中间量：旧网格 B 配新片区 A 时该片区户数"
+    )
+    old_grid_a_with_new_districts_b: int = Field(
+        ..., description="折算中间量：旧网格 A 配新片区 B 时该片区户数"
+    )
+
+
+class AttributionOut(BaseModel):
+    """两次成功生成之间的片区户数变动归因。
+
+    仅比较片区编号集合完全相同的任务；各任务固定其旧网格与新片区版本。
+    """
+
+    generation_a: int = Field(..., description="前一期生成任务编号")
+    generation_b: int = Field(..., description="后一期生成任务编号")
+    old_version_a: int
+    new_version_a: int
+    old_version_b: int
+    new_version_b: int
+    total_before: int
+    total_after: int
+    total_change: int
+    total_old_grid_change: float = Field(
+        ..., description="各片区旧网格修订贡献之和（半户粒度）"
+    )
+    total_new_boundary_change: float = Field(
+        ..., description="各片区边界调整贡献之和（半户粒度）"
+    )
+    districts: list[DistrictAttributionOut]

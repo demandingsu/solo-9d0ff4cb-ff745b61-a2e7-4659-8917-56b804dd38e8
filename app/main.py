@@ -8,9 +8,11 @@ from fastapi import Depends, FastAPI, HTTPException, Path as PathParam, Query
 from fastapi.responses import RedirectResponse
 from sqlite3 import Connection
 
+from . import allocation as alloc
 from . import db
 from .config import DB_PATH, WORKER_THREADS
 from .models import (
+    AttributionOut,
     CurrentResultOut,
     GenerationOut,
     HealthOut,
@@ -172,3 +174,45 @@ def get_current_result(conn: Connection = Depends(get_db)):
     if result is None:
         raise HTTPException(status_code=404, detail="尚无已发布的生成结果")
     return result
+
+
+@app.get("/attribution", response_model=AttributionOut, tags=["结果归因"])
+def get_attribution(
+    from_generation: int = Query(
+        ..., ge=1, alias="from", description="前一期生成任务编号"
+    ),
+    to_generation: int = Query(
+        ..., ge=1, alias="to", description="后一期生成任务编号"
+    ),
+    conn: Connection = Depends(get_db),
+):
+    """按两个成功生成任务编号，归因各片区户数变动。
+
+    - 仅比较片区编号集合完全相同的两次生成，否则 422；
+    - `from` 作为前一期、`to` 作为后一期；两者须为不同任务，交换后各项贡献取反；
+    - 沿用各任务创建时固定的旧网格 / 新片区版本，不读取“当前版本”；
+    - 分别计算“先换旧网格”与“先换新片区”两条折算路径，
+      以两条路径贡献的平均值给出旧网格修订 / 新片区边界调整两项（允许半户）；
+    - 任一交叉折算缺少完整覆盖时拒绝（422）；
+    - 只读查询，不发布结果，也不受查询期间新版本发布影响。
+    """
+    if from_generation == to_generation:
+        raise HTTPException(
+            status_code=422, detail="需要两个不同的生成任务编号"
+        )
+    try:
+        return db.attribute_generations(from_generation, to_generation, conn)
+    except db.GenerationNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except db.GenerationNotComparableError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except (
+        alloc.AttributionDistrictMismatchError,
+        alloc.AttributionCoverageError,
+    ) as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except alloc.AttributionIntegrityError as exc:
+        # 内部对账失败属于服务端缺陷，宁可 500 也不返回不可信数字
+        raise HTTPException(
+            status_code=500, detail=f"归因对账校验失败：{exc}"
+        )

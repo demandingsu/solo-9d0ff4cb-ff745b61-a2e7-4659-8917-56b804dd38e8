@@ -80,6 +80,14 @@ class ValidationError(Exception):
     """输入业务校验失败（编号重复、内部重叠等）。"""
 
 
+class GenerationNotFoundError(Exception):
+    """归因所引用的生成任务不存在。"""
+
+
+class GenerationNotComparableError(Exception):
+    """生成任务未成功，无法参与归因对比。"""
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -323,6 +331,89 @@ def _mark_failed(conn: sqlite3.Connection, gen_id: int, message: str) -> None:
         (message, _now(), gen_id),
     )
     conn.commit()
+
+
+# ---------- 两次生成结果归因 ----------
+
+def _load_comparable_snapshot(
+    conn: sqlite3.Connection, gen_id: int
+) -> dict[str, Any]:
+    """读取某任务成功时固定的 old/new 版本快照（只读，不触碰当前版本）。"""
+    row = conn.execute("SELECT * FROM generations WHERE id = ?", (gen_id,)).fetchone()
+    if row is None:
+        raise GenerationNotFoundError(f"生成任务 {gen_id} 不存在")
+    if row["status"] != "succeeded":
+        raise GenerationNotComparableError(
+            f"生成任务 {gen_id} 状态为 {row['status']}，只有成功的任务可参与归因"
+        )
+    return _load_snapshot(conn, gen_id)
+
+
+def attribute_generations(
+    gen_a: int, gen_b: int, conn: sqlite3.Connection
+) -> dict[str, Any]:
+    """比较两次成功生成，给出各片区两项变动来源与前后户数。
+
+    两次快照在同一读事务内读取：查询期间新发布的版本不会改变本次对比。
+    任何异常都向上抛出，不写入 current_result，也不影响已发布结果。
+    """
+    if gen_a == gen_b:
+        raise GenerationNotComparableError(
+            "需要两个不同的生成任务编号才能归因"
+        )
+    # 在同一个读事务内读取两份快照（WAL 下读事务持有稳定的数据库视图），
+    # 因此查询期间新发布的版本既不会改变任务固定的输入版本，也不会让两次
+    # 快照读到不一致的中间状态。整个函数只读，不触碰 current_result。
+    started_tx = not conn.in_transaction
+    if started_tx:
+        conn.execute("BEGIN")
+    try:
+        snap_a = _load_comparable_snapshot(conn, gen_a)
+        snap_b = _load_comparable_snapshot(conn, gen_b)
+    finally:
+        if started_tx:
+            conn.rollback()
+
+    result = alloc.attribute_periods(
+        snap_a["old_cells"],
+        snap_a["districts"],
+        snap_b["old_cells"],
+        snap_b["districts"],
+    )
+    return {
+        "generation_a": gen_a,
+        "generation_b": gen_b,
+        "old_version_a": snap_a["old_version"]["version"],
+        "new_version_a": snap_a["new_version"]["version"],
+        "old_version_b": snap_b["old_version"]["version"],
+        "new_version_b": snap_b["new_version"]["version"],
+        "total_before": result.total_before,
+        "total_after": result.total_after,
+        "total_change": result.total_change,
+        "total_old_grid_change": result.total_old_grid_half_units / 2,
+        "total_new_boundary_change": result.total_new_boundary_half_units / 2,
+        "districts": [
+            {
+                "district_id": r.district_id,
+                "before_households": r.before_households,
+                "after_households": r.after_households,
+                "change": r.change,
+                "old_grid_change": r.old_grid_half_units / 2,
+                "new_boundary_change": r.new_boundary_half_units / 2,
+                "old_grid_first": {
+                    "old_grid_change": r.old_grid_first.old_grid,
+                    "new_boundary_change": r.old_grid_first.new_boundary,
+                },
+                "new_boundary_first": {
+                    "old_grid_change": r.new_boundary_first.old_grid,
+                    "new_boundary_change": r.new_boundary_first.new_boundary,
+                },
+                "old_grid_b_with_new_districts_a": r.old_b_with_new_a,
+                "old_grid_a_with_new_districts_b": r.old_a_with_new_b,
+            }
+            for r in result.districts
+        ],
+    }
 
 
 def get_generation(gen_id: int, conn: sqlite3.Connection) -> dict[str, Any] | None:
